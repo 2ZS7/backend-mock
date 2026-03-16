@@ -1,12 +1,14 @@
 # database.py
 from motor.motor_asyncio import AsyncIOMotorClient
+import redis.asyncio as redis # Используем современный асинхронный клиент
 
-# Адрес базы данных (так как мы подняли её в Docker на 27017, стучимся туда)
+# --- MongoDB ---
 MONGO_URL = "mongodb://localhost:27017"
-
-client = AsyncIOMotorClient(MONGO_URL)
-# Выбираем базу данных (она создастся автоматически при первой записи)
-db = client["mock_engine_db"]
-
-# Удобная ссылка на коллекции
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client["mock_engine_db"]
 sessions_collection = db["sessions"]
+
+# --- Redis ---
+REDIS_URL = "redis://localhost:6379"
+# decode_responses=True означает, что Redis будет возвращать обычные строки, а не байты
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)

@@ -1,4 +1,4 @@
-# main.py
+import re
 from fastapi import FastAPI
 from models.session import SessionCreate, SessionModel
 from database import sessions_collection, redis_client
@@ -20,6 +20,16 @@ async def create_session(session_in: SessionCreate):
     
     # 4. Возвращаем модель клиенту
     return new_session
+
+
+from models.definition import DefinitionCreate, DefinitionModel
+from database import definitions_collection
+
+@app.post("/definitions", response_model=DefinitionModel)
+async def create_definition(def_in: DefinitionCreate):
+    new_def = DefinitionModel(**def_in.model_dump())
+    await definitions_collection.insert_one(new_def.model_dump(by_alias=True))
+    return new_def
 
 
 from fastapi import Request, HTTPException
@@ -45,14 +55,29 @@ async def proxy_engine(request: Request, path: str):
         raise HTTPException(status_code=401, detail="Session is invalid or expired")
 
     # 3. Если мы здесь, значит сессия валидна! 
-    # В будущем тут будет поход в MongoDB за правилами и сохранением состояния (Шаги 6-12 с диаграммы).
-    # Пока вернем тестовый ответ:
+    # PRIORITY MATCHING ENGINE
+    
+    # 1. Ищем в базе правила для текущего метода (и для универсального "ANY")
+    # Сортируем по priority по убыванию (-1)
+    cursor = definitions_collection.find({"method": {"$in": [request.method, "ANY"]}})
+    cursor.sort("priority", -1)
+    rules = await cursor.to_list(length=100) # Берем топ-100 правил
+
+    matched_rule = None
+    
+    # 2. Проверяем регулярные выражения
+    for rule in rules:
+        # re.match проверяет, подходит ли запрошенный path под шаблон из базы
+        if re.match(rule["path_pattern"], path):
+            matched_rule = rule
+            break # Нашли самое приоритетное совпадение — останавливаемся!
+
+    # 3. Если правило не найдено (тот самый Fallback)
+    if not matched_rule:
+        raise HTTPException(status_code=404, detail=f"No mock rule found for {request.method} /{path}")
+
+    # 4. Если нашли — возвращаем то, что тестировщик заложил в response_payload
     return JSONResponse(
-        status_code=200,
-        content={
-            "message": "Прокси-сервер успешно проверил сессию в Redis!",
-            "requested_path": f"/{path}",
-            "method": request.method,
-            "session_id": session_id
-        }
+        status_code=matched_rule["status_code"],
+        content=matched_rule["response_payload"]
     )

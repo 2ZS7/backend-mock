@@ -7,6 +7,7 @@ MONGO_URL = "mongodb://localhost:27017"
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["mock_engine_db"]
 sessions_collection = db["sessions"]
+definitions_collection = db["definitions"]
 
 # --- Redis ---
 REDIS_URL = "redis://localhost:6379"

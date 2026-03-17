@@ -75,9 +75,45 @@ async def proxy_engine(request: Request, path: str):
     # 3. Если правило не найдено (тот самый Fallback)
     if not matched_rule:
         raise HTTPException(status_code=404, detail=f"No mock rule found for {request.method} /{path}")
+    
+    # STATEFUL ЛОГИКА (Работа с виртуальной БД)
 
-    # 4. Если нашли — возвращаем то, что тестировщик заложил в response_payload
+    state_logic = matched_rule.get("state_logic")
+    
+    if state_logic:
+        action = state_logic.get("action")
+        collection_name = state_logic.get("collection_name")
+        
+        # СЦЕНАРИЙ А: Сохраняем данные (POST)
+        if action == "insert":
+            body = await request.json() # Читаем тело запроса от теста
+            
+            # Формируем документ для виртуальной БД
+            virtual_doc = {
+                "session_id": session_id,
+                "entity_type": collection_name,
+                "payload": body
+            }
+            await virtual_state_collection.insert_one(virtual_doc)
+            
+            return JSONResponse(status_code=matched_rule["status_code"], content={"message": "Saved successfully", "data": body})
+
+        # СЦЕНАРИЙ Б: Отдаем сохраненные данные (GET)
+        elif action == "find":
+            # Ищем ТОЛЬКО те данные, которые принадлежат этой сессии и этому типу!
+            cursor = virtual_state_collection.find({
+                "session_id": session_id,
+                "entity_type": collection_name
+            })
+            
+            saved_docs = await cursor.to_list(length=100)
+            # Вытаскиваем только payload, чтобы отдать чистые данные
+            result_data = [doc["payload"] for doc in saved_docs]
+            
+            return JSONResponse(status_code=matched_rule["status_code"], content=result_data)
+
+    # 4. Если state_logic нет, работаем по-старому (Stateless)
     return JSONResponse(
         status_code=matched_rule["status_code"],
-        content=matched_rule["response_payload"]
+        content=matched_rule.get("response_payload", {})
     )

@@ -1,7 +1,7 @@
 import re
 from fastapi import FastAPI
 from models.session import SessionCreate, SessionModel
-from database import sessions_collection, redis_client
+from database import sessions_collection, redis_client, virtual_state_collection
 
 app = FastAPI(title="Stateful Mock Engine")
 

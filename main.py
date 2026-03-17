@@ -1,9 +1,23 @@
 import re
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from models.session import SessionCreate, SessionModel
-from database import sessions_collection, redis_client, virtual_state_collection
+from datetime import datetime, timezone
+from database import sessions_collection, redis_client, virtual_state_collection, definitions_collection, request_logs_collection
+from models.definition import DefinitionCreate, DefinitionModel
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Stateful Mock Engine")
+
+# --- НАСТРОЙКА CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # В реальном проде тут будет URL фронтенда, но для ВКР ставим "*"
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.post("/sessions", response_model=SessionModel)
 async def create_session(session_in: SessionCreate):
@@ -22,8 +36,6 @@ async def create_session(session_in: SessionCreate):
     return new_session
 
 
-from models.definition import DefinitionCreate, DefinitionModel
-from database import definitions_collection
 
 @app.post("/definitions", response_model=DefinitionModel)
 async def create_definition(def_in: DefinitionCreate):
@@ -32,8 +44,6 @@ async def create_definition(def_in: DefinitionCreate):
     return new_def
 
 
-from datetime import datetime, timezone
-from database import request_logs_collection
 
 async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, status_code: int):
     """Фоновая задача для записи лога в MongoDB"""
@@ -54,8 +64,27 @@ async def log_request_to_db(session_id: str, method: str, path: str, rule_id: st
     await request_logs_collection.insert_one(log_doc)
 
 
-from fastapi import Request, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+@app.get("/sessions", response_model=list[SessionModel])
+async def get_sessions():
+    """Получить список всех сессий для Dashboard"""
+    cursor = sessions_collection.find()
+    # Сортируем от новых к старым
+    cursor.sort("created_at", -1)
+    sessions = await cursor.to_list(length=100)
+    return sessions
+
+@app.get("/logs/{session_id}")
+async def get_session_logs(session_id: str):
+    """Получить логи конкретной сессии для Инспектора"""
+    cursor = request_logs_collection.find({"session_id": session_id})
+    cursor.sort("timestamp", -1)
+    logs = await cursor.to_list(length=200)
+    
+    # MongoDB возвращает _id как ObjectId, нам нужно превратить его в строку для JSON
+    for log in logs:
+        log["_id"] = str(log["_id"])
+    return logs
+
 
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

@@ -32,12 +32,34 @@ async def create_definition(def_in: DefinitionCreate):
     return new_def
 
 
-from fastapi import Request, HTTPException
+from datetime import datetime, timezone
+from database import request_logs_collection
+
+async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, status_code: int):
+    """Фоновая задача для записи лога в MongoDB"""
+    log_doc = {
+        "session_id": session_id,
+        "timestamp": datetime.now(timezone.utc),
+        "request": {
+            "method": method,
+            "path": path
+        },
+        "engine_decision": {
+            "matched_rule_id": rule_id
+        },
+        "response": {
+            "status_code": status_code
+        }
+    }
+    await request_logs_collection.insert_one(log_doc)
+
+
+from fastapi import Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_engine(request: Request, path: str):
+async def proxy_engine(request: Request, path: str, background_tasks: BackgroundTasks):
     
     # 1. Извлекаем заголовок (в FastAPI ключи заголовков всегда приводятся к нижнему регистру)
     session_id = request.headers.get("x-session-id")
@@ -74,11 +96,19 @@ async def proxy_engine(request: Request, path: str):
 
     # 3. Если правило не найдено (тот самый Fallback)
     if not matched_rule:
-        raise HTTPException(status_code=404, detail=f"No mock rule found for {request.method} /{path}")
+        # 1. Добавляем задачу в фон (используем строку "None" или пустоту для rule_id)
+        background_tasks.add_task(log_request_to_db, session_id, request.method, path, "no_rule", 404)
+          
+        # Возвращаем JSONResponse вместо raise HTTPException!
+        return JSONResponse(
+            status_code=404, 
+            content={"detail": f"No mock rule found for {request.method} /{path}"}
+        )
     
     # STATEFUL ЛОГИКА (Работа с виртуальной БД)
 
     state_logic = matched_rule.get("state_logic")
+    rule_id_str = str(matched_rule.get("_id", "")) # Получаем ID сработавшего правила
     
     if state_logic:
         action = state_logic.get("action")
@@ -96,7 +126,9 @@ async def proxy_engine(request: Request, path: str):
             }
             await virtual_state_collection.insert_one(virtual_doc)
             
-            return JSONResponse(status_code=matched_rule["status_code"], content={"message": "Saved successfully", "data": body})
+             # Кидаем лог в фон перед возвратом ответа!
+            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
+            return JSONResponse(status_code=matched_rule["status_code"], content={"message": "Saved", "data": body})
 
         # СЦЕНАРИЙ Б: Отдаем сохраненные данные (GET)
         elif action == "find":
@@ -110,9 +142,13 @@ async def proxy_engine(request: Request, path: str):
             # Вытаскиваем только payload, чтобы отдать чистые данные
             result_data = [doc["payload"] for doc in saved_docs]
             
+             # Кидаем лог в фон!
+            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
             return JSONResponse(status_code=matched_rule["status_code"], content=result_data)
 
     # 4. Если state_logic нет, работаем по-старому (Stateless)
+    # Кидаем лог в фон для Stateless правил!
+    background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
     return JSONResponse(
         status_code=matched_rule["status_code"],
         content=matched_rule.get("response_payload", {})

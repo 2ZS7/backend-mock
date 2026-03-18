@@ -86,6 +86,17 @@ async def get_session_logs(session_id: str):
     return logs
 
 
+@app.delete("/sessions/{session_id}")
+async def finish_session(session_id: str):
+    # 1. Меняем статус в MongoDB
+    await sessions_collection.update_one(
+        {"_id": session_id}, {"$set": {"status": "finished"}}
+    )
+    # 2. Удаляем из Redis (тест больше не сможет обращаться к прокси)
+    await redis_client.delete(f"session:{session_id}:active")
+    return {"message": "Session finished"}
+
+
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_engine(request: Request, path: str, background_tasks: BackgroundTasks):

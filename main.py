@@ -1,5 +1,5 @@
 import re
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Path
 from models.session import SessionCreate, SessionModel
 from datetime import datetime, timezone
 from database import sessions_collection, redis_client, virtual_state_collection, definitions_collection, request_logs_collection
@@ -36,6 +36,27 @@ async def create_session(session_in: SessionCreate):
     return new_session
 
 
+@app.get("/sessions", response_model=list[SessionModel])
+async def get_sessions():
+    """Получить список всех сессий для Dashboard"""
+    cursor = sessions_collection.find()
+    # Сортируем от новых к старым
+    cursor.sort("created_at", -1)
+    sessions = await cursor.to_list(length=100)
+    return sessions
+
+
+@app.delete("/sessions/{session_id}")
+async def finish_session(session_id: str):
+    # 1. Меняем статус в MongoDB
+    await sessions_collection.update_one(
+        {"_id": session_id}, {"$set": {"status": "finished"}}
+    )
+    # 2. Удаляем из Redis (тест больше не сможет обращаться к прокси)
+    await redis_client.delete(f"session:{session_id}:active")
+    return {"message": "Session finished"}
+
+
 
 @app.post("/definitions", response_model=DefinitionModel)
 async def create_definition(def_in: DefinitionCreate):
@@ -43,7 +64,26 @@ async def create_definition(def_in: DefinitionCreate):
     await definitions_collection.insert_one(new_def.model_dump(by_alias=True))
     return new_def
 
+# ОБНОВЛЕНИЕ ПРАВИЛА
+@app.put("/definitions/{def_id}", response_model=DefinitionModel)
+async def update_definition(def_id: str, def_in: DefinitionCreate):
+    # Находим по _id и обновляем
+    updated_def = await definitions_collection.find_one_and_update(
+        {"_id": def_id}, 
+        {"$set": def_in.model_dump()},
+        return_document=True
+    )
+    if not updated_def:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return updated_def
 
+# УДАЛЕНИЕ ПРАВИЛА
+@app.delete("/definitions/{def_id}")
+async def delete_definition(def_id: str):
+    result = await definitions_collection.delete_one({"_id": def_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return {"message": "Rule deleted successfully"}
 
 async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, status_code: int):
     """Фоновая задача для записи лога в MongoDB"""
@@ -64,15 +104,6 @@ async def log_request_to_db(session_id: str, method: str, path: str, rule_id: st
     await request_logs_collection.insert_one(log_doc)
 
 
-@app.get("/sessions", response_model=list[SessionModel])
-async def get_sessions():
-    """Получить список всех сессий для Dashboard"""
-    cursor = sessions_collection.find()
-    # Сортируем от новых к старым
-    cursor.sort("created_at", -1)
-    sessions = await cursor.to_list(length=100)
-    return sessions
-
 @app.get("/logs/{session_id}")
 async def get_session_logs(session_id: str):
     """Получить логи конкретной сессии для Инспектора"""
@@ -84,17 +115,6 @@ async def get_session_logs(session_id: str):
     for log in logs:
         log["_id"] = str(log["_id"])
     return logs
-
-
-@app.delete("/sessions/{session_id}")
-async def finish_session(session_id: str):
-    # 1. Меняем статус в MongoDB
-    await sessions_collection.update_one(
-        {"_id": session_id}, {"$set": {"status": "finished"}}
-    )
-    # 2. Удаляем из Redis (тест больше не сможет обращаться к прокси)
-    await redis_client.delete(f"session:{session_id}:active")
-    return {"message": "Session finished"}
 
 
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)

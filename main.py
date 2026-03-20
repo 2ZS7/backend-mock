@@ -1,4 +1,5 @@
 import re
+from urllib import request
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Path
 from models.session import SessionCreate, SessionModel
 from datetime import datetime, timezone
@@ -57,6 +58,14 @@ async def finish_session(session_id: str):
     return {"message": "Session finished"}
 
 
+@app.get("/definitions", response_model=list[DefinitionModel])
+async def get_definitions():
+    cursor = definitions_collection.find()
+    # to_list(length=100) возвращает список, это верно
+    rules = await cursor.to_list(length=100) 
+    
+    # ПРОВЕРКА: если правил нет, верни пустой список, а не None
+    return rules if rules is not None else []
 
 @app.post("/definitions", response_model=DefinitionModel)
 async def create_definition(def_in: DefinitionCreate):
@@ -85,7 +94,8 @@ async def delete_definition(def_id: str):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"message": "Rule deleted successfully"}
 
-async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, status_code: int):
+
+async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, rule_name: str, status_code: int):
     """Фоновая задача для записи лога в MongoDB"""
     log_doc = {
         "session_id": session_id,
@@ -95,7 +105,8 @@ async def log_request_to_db(session_id: str, method: str, path: str, rule_id: st
             "path": path
         },
         "engine_decision": {
-            "matched_rule_id": rule_id
+            "matched_rule_id": rule_id,
+            "matched_rule_name": rule_name
         },
         "response": {
             "status_code": status_code
@@ -152,6 +163,9 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
         # re.match проверяет, подходит ли запрошенный path под шаблон из базы
         if re.match(rule["path_pattern"], path):
             matched_rule = rule
+            rule_id_str = str(rule.get("_id"))
+            rule_name = rule.get("name", "Unknown")
+            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, rule_name, matched_rule["status_code"])
             break # Нашли самое приоритетное совпадение — останавливаемся!
 
     # 3. Если правило не найдено (тот самый Fallback)

@@ -10,6 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Stateful Mock Engine")
 
+async def create_indexes():
+    # Мы ищем логи по session_id, поэтому индекс критически важен!
+    await request_logs_collection.create_index("session_id")
+    # Ищем правила по методу и приоритету
+    await definitions_collection.create_index([("method", 1), ("priority", -1)])
+    await virtual_state_collection.create_index("session_id")
+    
+@app.on_event("startup")
+async def startup_event():
+    await create_indexes()
+
 # --- НАСТРОЙКА CORS ---
 app.add_middleware(
     CORSMiddleware,

@@ -142,99 +142,68 @@ async def get_session_logs(session_id: str):
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_engine(request: Request, path: str, background_tasks: BackgroundTasks):
-    
-    # 1. Извлекаем заголовок (в FastAPI ключи заголовков всегда приводятся к нижнему регистру)
     session_id = request.headers.get("x-session-id")
-    
     if not session_id:
-        # Если автотест забыл передать сессию — сразу отбиваем
         raise HTTPException(status_code=401, detail="X-Session-ID header is missing")
 
-    # 2. Проверяем валидность сессии в Redis (тот самый Слой Надежности)
     redis_key = f"session:{session_id}:active"
-    is_active = await redis_client.get(redis_key) # Вернет "true" или None
-    
+    is_active = await redis_client.get(redis_key)
     if is_active is None:
-        # Если в Redis пусто (nil) — сессия протухла или не существует
         raise HTTPException(status_code=401, detail="Session is invalid or expired")
 
-    # 3. Если мы здесь, значит сессия валидна! 
-    # PRIORITY MATCHING ENGINE
-    
-    # 1. Ищем в базе правила для текущего метода (и для универсального "ANY")
-    # Сортируем по priority по убыванию (-1)
+    # 1. Поиск правил
     cursor = definitions_collection.find({"method": {"$in": [request.method, "ANY"]}})
     cursor.sort("priority", -1)
-    rules = await cursor.to_list(length=100) # Берем топ-100 правил
+    rules = await cursor.to_list(length=100)
 
     matched_rule = None
-    
-    # 2. Проверяем регулярные выражения
     for rule in rules:
-        # re.match проверяет, подходит ли запрошенный path под шаблон из базы
         if re.match(rule["path_pattern"], path):
             matched_rule = rule
-            rule_id_str = str(rule.get("_id"))
-            rule_name = rule.get("name", "Unknown")
-            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, rule_name, matched_rule["status_code"])
-            break # Нашли самое приоритетное совпадение — останавливаемся!
+            break
 
-    # 3. Если правило не найдено (тот самый Fallback)
     if not matched_rule:
-        # 1. Добавляем задачу в фон (используем строку "None" или пустоту для rule_id)
-        background_tasks.add_task(log_request_to_db, session_id, request.method, path, "no_rule", 404)
-          
-        # Возвращаем JSONResponse вместо raise HTTPException!
+        background_tasks.add_task(log_request_to_db, session_id, request.method, path, None, "no_rule", 404)
         return JSONResponse(
             status_code=404, 
             content={"detail": f"No mock rule found for {request.method} /{path}"}
         )
     
-    # STATEFUL ЛОГИКА (Работа с виртуальной БД)
-
+    # 2. Подготовка метаданных для единого логирования
+    rule_id_str = str(matched_rule.get("_id", ""))
+    rule_name = matched_rule.get("name", "Unknown")
     state_logic = matched_rule.get("state_logic")
-    rule_id_str = str(matched_rule.get("_id", "")) # Получаем ID сработавшего правила
     
+    response_status = matched_rule["status_code"]
+    response_content = matched_rule.get("response_payload", {})
+
+    # 3. Выполнение логики состояния (БЕЗ отправки логов внутри блоков!)
     if state_logic:
         action = state_logic.get("action")
         collection_name = state_logic.get("collection_name")
         
-        # СЦЕНАРИЙ А: Сохраняем данные (POST)
         if action == "insert":
-            body = await request.json() # Читаем тело запроса от теста
-            
-            # Формируем документ для виртуальной БД
-            virtual_doc = {
-                "session_id": session_id,
-                "entity_type": collection_name,
-                "payload": body
-            }
+            body = await request.json()
+            virtual_doc = {"session_id": session_id, "entity_type": collection_name, "payload": body}
             await virtual_state_collection.insert_one(virtual_doc)
-            
-             # Кидаем лог в фон перед возвратом ответа!
-            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
-            return JSONResponse(status_code=matched_rule["status_code"], content={"message": "Saved", "data": body})
+            response_content = {"message": "Saved", "data": body}
+            response_status = 201
 
-        # СЦЕНАРИЙ Б: Отдаем сохраненные данные (GET)
         elif action == "find":
-            # Ищем ТОЛЬКО те данные, которые принадлежат этой сессии и этому типу!
-            cursor = virtual_state_collection.find({
-                "session_id": session_id,
-                "entity_type": collection_name
-            })
-            
-            saved_docs = await cursor.to_list(length=100)
-            # Вытаскиваем только payload, чтобы отдать чистые данные
-            result_data = [doc["payload"] for doc in saved_docs]
-            
-             # Кидаем лог в фон!
-            background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
-            return JSONResponse(status_code=matched_rule["status_code"], content=result_data)
+            cursor_state = virtual_state_collection.find({"session_id": session_id, "entity_type": collection_name})
+            saved_docs = await cursor_state.to_list(length=100)
+            response_content = [doc["payload"] for doc in saved_docs]
+            response_status = 200
 
-    # 4. Если state_logic нет, работаем по-старому (Stateless)
-    # Кидаем лог в фон для Stateless правил!
-    background_tasks.add_task(log_request_to_db, session_id, request.method, path, rule_id_str, matched_rule["status_code"])
-    return JSONResponse(
-        status_code=matched_rule["status_code"],
-        content=matched_rule.get("response_payload", {})
+    # 4. ЕДИНСТВЕННЫЙ ВЫЗОВ ЛОГЕРА (Гарантирует отсутствие дубликатов)
+    background_tasks.add_task(
+        log_request_to_db, 
+        session_id, 
+        request.method, 
+        path, 
+        rule_id_str, 
+        rule_name, 
+        response_status
     )
+
+    return JSONResponse(status_code=response_status, content=response_content)

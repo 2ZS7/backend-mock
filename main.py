@@ -112,17 +112,19 @@ async def log_request_to_db(
     rule_id: str | None, 
     rule_name: str | None, 
     status_code: int,
-    request_body: any = None, # <--- Добавили
-    response_body: any = None # <--- Добавили
+    request_body: any = None,
+    response_body: any = None
 ):
-    """Фоновая задача для записи лога в MongoDB"""
+    """Фоновая задача для записи лога и обновления метрик сессии в MongoDB"""
+    
+    # 1. Записываем сам лог транзакции в request_logs (как было)
     log_doc = {
         "session_id": session_id,
         "timestamp": datetime.now(timezone.utc),
         "request": {
             "method": method,
             "path": path,
-            "body": request_body # <--- Записываем тело запроса
+            "body": request_body
         },
         "engine_decision": {
             "matched_rule_id": None if rule_id in ("no_rule", None) else rule_id,
@@ -130,24 +132,25 @@ async def log_request_to_db(
         },
         "response": {
             "status_code": status_code,
-            "body": response_body # <--- Записываем тело ответа
+            "body": response_body
         }
     }
     await request_logs_collection.insert_one(log_doc)
 
-
-@app.get("/logs/{session_id}")
-async def get_session_logs(session_id: str):
-    """Получить логи конкретной сессии для Инспектора"""
-    cursor = request_logs_collection.find({"session_id": session_id})
-    cursor.sort("timestamp", -1)
-    logs = await cursor.to_list(length=200)
+    # ==========================================================
+    # ОБНОВЛЕНИЕ МЕТРИК СЕССИИ (Новый блок!)
+    # ==========================================================
+    # При каждом запросе увеличиваем total_requests на 1
+    update_query = {"$inc": {"metrics.total_requests": 1}}
     
-    # MongoDB возвращает _id как ObjectId, нам нужно превратить его в строку для JSON
-    for log in logs:
-        log["_id"] = str(log["_id"])
-    return logs
+    # Если статус ответа >= 400 (ошибка), то увеличиваем и failed_requests на 1
+    if status_code >= 400:
+        update_query["$inc"]["metrics.failed_requests"] = 1
+        
+    # Асинхронно обновляем документ сессии в MongoDB
+    await sessions_collection.update_one({"_id": session_id}, update_query)
 
+    
 
 # Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

@@ -105,22 +105,32 @@ async def delete_definition(def_id: str):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"message": "Rule deleted successfully"}
 
-
-async def log_request_to_db(session_id: str, method: str, path: str, rule_id: str, rule_name: str, status_code: int):
+async def log_request_to_db(
+    session_id: str, 
+    method: str, 
+    path: str, 
+    rule_id: str | None, 
+    rule_name: str | None, 
+    status_code: int,
+    request_body: any = None, # <--- Добавили
+    response_body: any = None # <--- Добавили
+):
     """Фоновая задача для записи лога в MongoDB"""
     log_doc = {
         "session_id": session_id,
         "timestamp": datetime.now(timezone.utc),
         "request": {
             "method": method,
-            "path": path
+            "path": path,
+            "body": request_body # <--- Записываем тело запроса
         },
         "engine_decision": {
-            "matched_rule_id": rule_id,
-            "matched_rule_name": rule_name
+            "matched_rule_id": None if rule_id in ("no_rule", None) else rule_id,
+            "matched_rule_name": rule_name if rule_name else "no_rule"
         },
         "response": {
-            "status_code": status_code
+            "status_code": status_code,
+            "body": response_body # <--- Записываем тело ответа
         }
     }
     await request_logs_collection.insert_one(log_doc)
@@ -151,7 +161,15 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
     if is_active is None:
         raise HTTPException(status_code=401, detail="Session is invalid or expired")
 
-    # 1. Поиск правил
+    # ЧИТАЕМ ТЕЛО ЗАПРОСА СТРОГО ОДИН РАЗ (для методов, которые могут его иметь)
+    body_json = None
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body_json = await request.json()
+        except Exception:
+            pass # Если тело пустое или это не JSON, оставляем None
+
+    # 1. Поиск правил в MongoDB
     cursor = definitions_collection.find({"method": {"$in": [request.method, "ANY"]}})
     cursor.sort("priority", -1)
     rules = await cursor.to_list(length=100)
@@ -162,14 +180,13 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
             matched_rule = rule
             break
 
+    # 2. Обработка случая, когда правило не найдено (404)
     if not matched_rule:
-        background_tasks.add_task(log_request_to_db, session_id, request.method, path, None, "no_rule", 404)
-        return JSONResponse(
-            status_code=404, 
-            content={"detail": f"No mock rule found for {request.method} /{path}"}
-        )
+        err_content = {"detail": f"No mock rule found for {request.method} /{path}"}
+        # Передаем тело запроса (body_json) и тело ответа (err_content) в лог
+        background_tasks.add_task(log_request_to_db, session_id, request.method, path, None, "no_rule", 404, body_json, err_content)
+        return JSONResponse(status_code=404, content=err_content)
     
-    # 2. Подготовка метаданных для единого логирования
     rule_id_str = str(matched_rule.get("_id", ""))
     rule_name = matched_rule.get("name", "Unknown")
     state_logic = matched_rule.get("state_logic")
@@ -177,25 +194,32 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
     response_status = matched_rule["status_code"]
     response_content = matched_rule.get("response_payload", {})
 
-    # 3. Выполнение логики состояния (БЕЗ отправки логов внутри блоков!)
+    # 3. Выполнение логики сохранения состояния (Stateful)
     if state_logic:
         action = state_logic.get("action")
         collection_name = state_logic.get("collection_name")
         
         if action == "insert":
-            body = await request.json()
-            virtual_doc = {"session_id": session_id, "entity_type": collection_name, "payload": body}
+            # Используем уже прочитанный body_json!
+            virtual_doc = {
+                "session_id": session_id,
+                "entity_type": collection_name,
+                "payload": body_json
+            }
             await virtual_state_collection.insert_one(virtual_doc)
-            response_content = {"message": "Saved", "data": body}
+            response_content = {"message": "Saved successfully", "data": body_json}
             response_status = 201
 
         elif action == "find":
-            cursor_state = virtual_state_collection.find({"session_id": session_id, "entity_type": collection_name})
+            cursor_state = virtual_state_collection.find({
+                "session_id": session_id,
+                "entity_type": collection_name
+            })
             saved_docs = await cursor_state.to_list(length=100)
             response_content = [doc["payload"] for doc in saved_docs]
             response_status = 200
 
-    # 4. ЕДИНСТВЕННЫЙ ВЫЗОВ ЛОГЕРА (Гарантирует отсутствие дубликатов)
+    # 4. ЗАПИСЬ ЛОГА (Передаем body_json и response_content)
     background_tasks.add_task(
         log_request_to_db, 
         session_id, 
@@ -203,7 +227,9 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
         path, 
         rule_id_str, 
         rule_name, 
-        response_status
+        response_status,
+        body_json,
+        response_content
     )
 
     return JSONResponse(status_code=response_status, content=response_content)

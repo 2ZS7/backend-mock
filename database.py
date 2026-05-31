@@ -4,7 +4,7 @@ import redis.asyncio as redis # Используем современный ас
 
 # --- MongoDB ---
 MONGO_URL = "mongodb://mongodb:27017"
-mongo_client = AsyncIOMotorClient(MONGO_URL)
+mongo_client = AsyncIOMotorClient(MONGO_URL, tz_aware=True) 
 db = mongo_client["mock_engine_db"]
 sessions_collection = db["sessions"]
 definitions_collection = db["definitions"]

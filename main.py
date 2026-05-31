@@ -230,12 +230,28 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
     cursor.sort("priority", -1)
     rules = await cursor.to_list(length=100)
 
+   # 2. Проверяем регулярные выражения (Умный отказоустойчивый роутинг)
     matched_rule = None
     for rule in rules:
-        if re.match(rule["path_pattern"], path):
+        # Убираем пробелы по краям
+        clean_path = path.strip()
+        pattern = rule["path_pattern"].strip()
+        
+        # Нормализуем начальные слэши (приводим к единому виду без слэша в начале)
+        # "/api/v1/users" превратится в "api/v1/users"
+        # "^/api/v1/users$" превратится в "^api/v1/users$"
+        if clean_path.startswith("/"):
+            clean_path = clean_path.lstrip("/")
+        if pattern.startswith("^/"):
+            pattern = "^" + pattern.lstrip("^/")
+        elif pattern.startswith("/"):
+            pattern = pattern.lstrip("/")
+
+        # re.match проверяет совпадение с начала строки
+        if re.match(pattern, clean_path):
             matched_rule = rule
             break
-
+        
     # 4. Обработка случая, когда правило не найдено (404)
     if not matched_rule:
         err_content = {"detail": f"No mock rule found for {request.method} /{path}"}

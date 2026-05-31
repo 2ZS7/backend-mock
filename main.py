@@ -50,11 +50,30 @@ async def create_session(session_in: SessionCreate):
 
 @app.get("/sessions", response_model=list[SessionModel])
 async def get_sessions():
-    """Получить список всех сессий для Dashboard"""
+    """Получить список всех сессий для Dashboard с ленивой синхронизацией статусов"""
     cursor = sessions_collection.find()
-    # Сортируем от новых к старым
     cursor.sort("created_at", -1)
     sessions = await cursor.to_list(length=100)
+    
+    # ==========================================================
+    # ЛЕНИВАЯ СИНХРОНИЗАЦИЯ СТАТУСОВ (Redis -> MongoDB)
+    # ==========================================================
+    for session in sessions:
+        if session["status"] == "active":
+            # Проверяем, существует ли еще ключ активности в Redis
+            redis_key = f"session:{session['_id']}:active"
+            is_active = await redis_client.get(redis_key)
+            
+            if is_active is None:
+                # Если в Redis ключа нет — значит, время жизни (TTL) сессии истекло!
+                # Переводим статус сессии в MongoDB в положение "finished"
+                await sessions_collection.update_one(
+                    {"_id": session["_id"]}, 
+                    {"$set": {"status": "finished"}}
+                )
+                # Обновляем статус в объекте ответа, который улетит на фронтенд
+                session["status"] = "finished"
+                
     return sessions
 
 
@@ -110,9 +129,10 @@ async def get_session_logs(session_id: str):
     """Получить логи конкретной сессии для Инспектора"""
     cursor = request_logs_collection.find({"session_id": session_id})
     cursor.sort("timestamp", -1)
-    logs = await cursor.to_list(length=200)
     
-    # MongoDB возвращает _id как ObjectId, нам нужно превратить его в строку для JSON
+    # УВЕЛИЧИЛИ ЛИМИТ ДО 1000, чтобы вмещать результаты нагрузочных тестов
+    logs = await cursor.to_list(length=1000) 
+    
     for log in logs:
         log["_id"] = str(log["_id"])
     return logs
@@ -163,9 +183,10 @@ async def log_request_to_db(
         traceback.print_exc() # Печатаем полный стек ошибки в консоль
 
 
-# Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше (типа /sessions)
+# Этот роут ловит любые пути и любые методы, которые не совпали с ручками выше
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_engine(request: Request, path: str, background_tasks: BackgroundTasks):
+    # 1. Извлечение и проверка сессии
     session_id = request.headers.get("x-session-id")
     if not session_id:
         raise HTTPException(status_code=401, detail="X-Session-ID header is missing")
@@ -175,15 +196,36 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
     if is_active is None:
         raise HTTPException(status_code=401, detail="Session is invalid or expired")
 
-    # ЧИТАЕМ ТЕЛО ЗАПРОСА СТРОГО ОДИН РАЗ (для методов, которые могут его иметь)
+    # ==========================================================
+    # ВСТАВИЛИ: СЛОЙ НАДЕЖНОСТИ - RATE LIMITING (Redis)
+    # ==========================================================
+    current_second = int(datetime.now(timezone.utc).timestamp())
+    rate_limit_key = f"rate_limit:{session_id}:{current_second}"
+    
+    # Атомарно увеличиваем счетчик запросов для текущей секунды
+    request_count = await redis_client.incr(rate_limit_key)
+    if request_count == 1:
+        await redis_client.expire(rate_limit_key, 2) # TTL 2 секунды для очистки
+        
+    max_limit = 5 # Устанавливаем жесткий лимит в 5 запросов в секунду для теста
+    
+    if request_count > max_limit:
+        # Асинхронно логируем превышение лимита в request_logs со статусом 429
+        background_tasks.add_task(log_request_to_db, session_id, request.method, path, None, "rate_limit_exceeded", 429, None, {"detail": "Too Many Requests"})
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too Many Requests. Rate limit exceeded (Max 5 requests per second)."}
+        )
+
+    # 2. Читаем тело запроса строго один раз
     body_json = None
     if request.method in ("POST", "PUT", "PATCH"):
         try:
             body_json = await request.json()
         except Exception:
-            pass # Если тело пустое или это не JSON, оставляем None
+            pass
 
-    # 1. Поиск правил в MongoDB
+    # 3. Поиск правил в MongoDB (Priority Matching)
     cursor = definitions_collection.find({"method": {"$in": [request.method, "ANY"]}})
     cursor.sort("priority", -1)
     rules = await cursor.to_list(length=100)
@@ -194,10 +236,9 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
             matched_rule = rule
             break
 
-    # 2. Обработка случая, когда правило не найдено (404)
+    # 4. Обработка случая, когда правило не найдено (404)
     if not matched_rule:
         err_content = {"detail": f"No mock rule found for {request.method} /{path}"}
-        # Передаем тело запроса (body_json) и тело ответа (err_content) в лог
         background_tasks.add_task(log_request_to_db, session_id, request.method, path, None, "no_rule", 404, body_json, err_content)
         return JSONResponse(status_code=404, content=err_content)
     
@@ -208,13 +249,12 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
     response_status = matched_rule["status_code"]
     response_content = matched_rule.get("response_payload", {})
 
-    # 3. Выполнение логики сохранения состояния (Stateful)
+    # 5. Выполнение логики сохранения состояния (Stateful)
     if state_logic:
         action = state_logic.get("action")
         collection_name = state_logic.get("collection_name")
         
         if action == "insert":
-            # Используем уже прочитанный body_json!
             virtual_doc = {
                 "session_id": session_id,
                 "entity_type": collection_name,
@@ -233,7 +273,7 @@ async def proxy_engine(request: Request, path: str, background_tasks: Background
             response_content = [doc["payload"] for doc in saved_docs]
             response_status = 200
 
-    # 4. ЗАПИСЬ ЛОГА (Передаем body_json и response_content)
+    # 6. ЕДИНАЯ ЗАПИСЬ ЛОГА В ФОНЕ (Гарантирует 1 лог на транзакцию)
     background_tasks.add_task(
         log_request_to_db, 
         session_id, 
